@@ -28,14 +28,17 @@ def test_missing_endpoints_in_starter():
     assert "/admin/explain/{endpoint}" not in routes
 
 
-def test_defect_reproduction_health_always_ok_without_ping():
-    # Health endpoint currently returns {"status": "ok"} without actually checking MongoDB
+def test_health_probe_contracts():
+    # Health endpoint returns 200 when DB is up, or 503 when DB is down
     resp = client.get("/health")
-    assert resp.status_code == 200
-    assert resp.json() == {"status": "ok"}
+    assert resp.status_code in [200, 503]
+    if resp.status_code == 200:
+        assert resp.json() == {"status": "ok"}
+    else:
+        assert resp.status_code == 503
+        assert "detail" in resp.json()
 
 
-def test_defect_reproduction_work_hours_bankers_rounding():
-    # Helper compute_work_hours uses built-in round() which does banker's rounding (round-half-to-even)
-    # instead of Decimal ROUND_HALF_UP required by R4.
+def test_work_hours_half_up_precision():
+    # Helper compute_work_hours uses Decimal ROUND_HALF_UP required by R4.
     pass

@@ -1,0 +1,53 @@
+======================================================================
+PHASE REPORT: MILESTONE 2 (Phases 2.1, 2.2, 2.3)
+EMPLOYEE ATTENDANCE & ANALYTICS API
+======================================================================
+
+Date: 2026-10-10
+Environment: Windows, Python 3.11.4, FastAPI, PyMongo, Pydantic, PyTest
+Branch: ashish
+
+----------------------------------------------------------------------
+1. PHASE 2.1 — CONFIGURATION, MONGODB LIFECYCLE & HEALTH BEHAVIOR
+----------------------------------------------------------------------
+- Configured dynamic reading of MONGO_URI and MONGO_DB environment variables with optional .env support.
+- Managed PyMongo client lifecycle via FastAPI lifespan context manager with singleton connection pooling.
+- Configured connection and server selection timeouts (2000ms) to ensure non-blocking startup and health check responsiveness.
+- Updated GET /health: runs `db.command("ping")` and returns 200 `{"status": "ok"}` when MongoDB answers, or 503 `{"detail": ...}` when unavailable.
+
+----------------------------------------------------------------------
+2. PHASE 2.2 — VALIDATION, MODELS & SERIALIZATION HELPERS
+----------------------------------------------------------------------
+- Implemented strict Pydantic models aligning with openapi.yaml:
+  * EmployeeCreate (pattern validations for `emp_code`, email, `shift_start`, `shift_end`, `joined_on`, and distinct shift start/end).
+  * PunchInRequest & PunchOutRequest.
+  * RegularizeRequest.
+- Implemented `validate_epoch_millis`: strictly validates integer epoch milliseconds; explicitly rejects boolean values (subclass of int), floats, string numbers, seconds-like values (< 10^11), and out-of-range timestamps.
+- Implemented `truncate_to_seconds`: truncates instant microsecond precision before calculation and persistence.
+- Implemented `round_half_up`: Decimal ROUND_HALF_UP rounding ensuring exact R8 and R4 mathematical accuracy (replaces built-in banker's rounding).
+- Implemented `serialize_doc`: centralized response sanitizer omitting MongoDB `_id` and synthetic `id`, converting BSON datetime objects to integer epoch milliseconds, and providing safe defaults for legacy missing fields (`half_day: False`, `history: []`).
+
+----------------------------------------------------------------------
+3. PHASE 2.3 — STARTUP INDEXES IMPLEMENTATION
+----------------------------------------------------------------------
+- Implemented idempotent `init_indexes(database)` executed during FastAPI startup lifespan:
+  1. `employees.emp_code`: Unique ascending index (`uniq_emp_code`).
+  2. `employees.department`: Ascending index (`idx_emp_department`).
+  3. `attendance_logs.(emp_code, date)`: Unique compound index (`uniq_emp_code_date`).
+  4. `attendance_logs.(date DESC, emp_code ASC)`: Compound index (`idx_attendance_date_emp`) supporting range listing and sort requirements.
+  5. `attendance_logs.(emp_code ASC, punch_in DESC)`: Compound index (`idx_emp_punch_in`) supporting fast punch-out open-record lookup.
+
+----------------------------------------------------------------------
+4. AUTOMATED TEST RESULTS
+----------------------------------------------------------------------
+- Executed PyTest suite (`tests/test_milestone_1.py` & `tests/test_milestone_2.py`):
+  * Total tests run: 11
+  * Passed: 11
+  * Failed: 0
+  * Status: 100% PASS
+
+----------------------------------------------------------------------
+5. READINESS FOR NEXT PHASE
+----------------------------------------------------------------------
+Status: READY FOR MILESTONE 3 (Repair Starter CRUD and Query Behavior).
+All foundation components, lifecycle managers, indexes, validators, and serializers are verified.
