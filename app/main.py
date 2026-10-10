@@ -425,6 +425,45 @@ class EmployeeMonthly(BaseModel):
     attendance_pct: Optional[float] = None
 
 
+class DepartmentSummaryItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    department: str
+    headcount: int
+    present_days: float
+    avg_work_hours: Optional[float] = None
+    late_count: int
+    total_late_minutes: int
+    leave_count: int
+    on_duty_count: int
+
+
+class DepartmentSummary(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    month: str
+    items: List[DepartmentSummaryItem]
+
+
+class LeaderboardItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    rank: int
+    emp_code: str
+    name: str
+    department: str
+    total_late_minutes: int
+    late_count: int
+
+
+class Leaderboard(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    month: str
+    items: List[LeaderboardItem]
+
+
+
 
 # --------------------------------------------------------------------------- #
 # Shift & Attendance Time Engine Helpers (R1-R5)
@@ -1046,6 +1085,319 @@ def employee_monthly(
 
 
 # --------------------------------------------------------------------------- #
-# End of Milestone 5 Implementation
+# Milestone 6: Cross-Collection & Ranking Analytics Endpoints
 # --------------------------------------------------------------------------- #
+@app.get(
+    "/analytics/departments/summary",
+    response_model=DepartmentSummary,
+    tags=["analytics"],
+)
+def department_summary(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    department: Optional[str] = Query(None),
+):
+    database = get_db()
+    year, m = map(int, month.split("-"))
+    month_start_date = f"{year:04d}-{m:02d}-01"
+    if m == 12:
+        month_end_date = f"{year:04d}-12-31"
+    else:
+        last_day = (date(year, m + 1, 1) - timedelta(days=1)).day
+        month_end_date = f"{year:04d}-{m:02d}-{last_day:02d}"
+
+    # Base match on employees: joined_on <= month_end_date (R9)
+    emp_match = {"joined_on": {"$lte": month_end_date}}
+    if department:
+        emp_match["department"] = department
+
+    pipeline = [
+        {"$match": emp_match},
+        # Join with attendance_logs for this employee within the month
+        {
+            "$lookup": {
+                "from": "attendance_logs",
+                "let": {"code": "$emp_code"},
+                "pipeline": [
+                    {
+                        "$match": {
+                            "$expr": {
+                                "$and": [
+                                    {"$eq": ["$emp_code", "$$code"]},
+                                    {"$gte": ["$date", month_start_date]},
+                                    {"$lte": ["$date", month_end_date]},
+                                ]
+                            }
+                        }
+                    },
+                    {
+                        "$addFields": {
+                            "date_obj": {"$dateFromString": {"dateString": "$date", "format": "%Y-%m-%d"}},
+                        }
+                    },
+                    {
+                        "$addFields": {
+                            "dayOfWeek": {"$dayOfWeek": "$date_obj"},
+                            "is_weekday": {
+                                "$and": [
+                                    {"$gt": [{"$dayOfWeek": "$date_obj"}, 1]},
+                                    {"$lt": [{"$dayOfWeek": "$date_obj"}, 7]},
+                                ]
+                            },
+                        }
+                    },
+                    {
+                        "$addFields": {
+                            "present_val": {
+                                "$cond": [
+                                    {
+                                        "$and": [
+                                            "$is_weekday",
+                                            {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                        ]
+                                    },
+                                    {"$cond": [{"$eq": ["$half_day", True]}, 0.5, 1.0]},
+                                    0.0,
+                                ]
+                            },
+                            "is_late": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]},
+                            "is_leave": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]},
+                            "is_on_duty": {"$cond": [{"$eq": ["$status", "ON_DUTY"]}, 1, 0]},
+                            # Qualifying record for work hours average: present-status and non-null work_hours
+                            "is_qualifying_work_record": {
+                                "$and": [
+                                    {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                    {"$ne": ["$work_hours", None]},
+                                ]
+                            },
+                        }
+                    },
+                ],
+                "as": "logs",
+            }
+        },
+        # Group by department across all qualifying employees
+        {
+            "$group": {
+                "_id": "$department",
+                "headcount": {"$sum": 1},
+                "all_logs": {"$push": "$logs"},
+            }
+        },
+        {
+            "$project": {
+                "department": "$_id",
+                "headcount": 1,
+                "flat_logs": {
+                    "$reduce": {
+                        "input": "$all_logs",
+                        "initialValue": [],
+                        "in": {"$concatArrays": ["$$value", "$$this"]},
+                    }
+                },
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "department": 1,
+                "headcount": 1,
+                "present_days": {
+                    "$sum": {
+                        "$map": {
+                            "input": "$flat_logs",
+                            "as": "l",
+                            "in": "$$l.present_val",
+                        }
+                    }
+                },
+                "late_count": {
+                    "$sum": {
+                        "$map": {
+                            "input": "$flat_logs",
+                            "as": "l",
+                            "in": "$$l.is_late",
+                        }
+                    }
+                },
+                "total_late_minutes": {
+                    "$sum": {
+                        "$map": {
+                            "input": "$flat_logs",
+                            "as": "l",
+                            "in": {"$ifNull": ["$$l.late_minutes", 0]},
+                        }
+                    }
+                },
+                "leave_count": {
+                    "$sum": {
+                        "$map": {
+                            "input": "$flat_logs",
+                            "as": "l",
+                            "in": "$$l.is_leave",
+                        }
+                    }
+                },
+                "on_duty_count": {
+                    "$sum": {
+                        "$map": {
+                            "input": "$flat_logs",
+                            "as": "l",
+                            "in": "$$l.is_on_duty",
+                        }
+                    }
+                },
+                "qualifying_work_hours": {
+                    "$filter": {
+                        "input": "$flat_logs",
+                        "as": "l",
+                        "cond": "$$l.is_qualifying_work_record",
+                    }
+                },
+            }
+        },
+        {
+            "$project": {
+                "department": 1,
+                "headcount": 1,
+                "present_days": 1,
+                "late_count": 1,
+                "total_late_minutes": 1,
+                "leave_count": 1,
+                "on_duty_count": 1,
+                "avg_work_hours": {
+                    "$cond": [
+                        {"$gt": [{"$size": "$qualifying_work_hours"}, 0]},
+                        {"$avg": "$qualifying_work_hours.work_hours"},
+                        None,
+                    ]
+                },
+            }
+        },
+        {"$sort": {"department": ASCENDING}},
+    ]
+
+    items = list(database.employees.aggregate(pipeline))
+    # Post-process precision using round_half_up (R8)
+    formatted_items = []
+    for item in items:
+        avg_wh = item.get("avg_work_hours")
+        formatted_items.append(
+            {
+                "department": item["department"],
+                "headcount": item["headcount"],
+                "present_days": round_half_up(item.get("present_days", 0.0), 2),
+                "avg_work_hours": round_half_up(avg_wh, 2) if avg_wh is not None else None,
+                "late_count": item.get("late_count", 0),
+                "total_late_minutes": item.get("total_late_minutes", 0),
+                "leave_count": item.get("leave_count", 0),
+                "on_duty_count": item.get("on_duty_count", 0),
+            }
+        )
+
+    return {
+        "month": month,
+        "items": formatted_items,
+    }
+
+
+@app.get(
+    "/analytics/leaderboard/late",
+    response_model=Leaderboard,
+    tags=["analytics"],
+)
+def late_leaderboard(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    limit: int = Query(10, ge=1, le=50),
+    department: Optional[str] = Query(None),
+):
+    database = get_db()
+    year, m = map(int, month.split("-"))
+    month_start_date = f"{year:04d}-{m:02d}-01"
+    if m == 12:
+        month_end_date = f"{year:04d}-12-31"
+    else:
+        last_day = (date(year, m + 1, 1) - timedelta(days=1)).day
+        month_end_date = f"{year:04d}-{m:02d}-{last_day:02d}"
+
+    # Aggregation starting from attendance_logs for the month
+    pipeline = [
+        {
+            "$match": {
+                "date": {"$gte": month_start_date, "$lte": month_end_date},
+                "late_minutes": {"$gt": 0},
+            }
+        },
+        {
+            "$group": {
+                "_id": "$emp_code",
+                "total_late_minutes": {"$sum": "$late_minutes"},
+                "late_count": {"$sum": 1},
+            }
+        },
+        {"$match": {"total_late_minutes": {"$gt": 0}}},
+        # Join employee details
+        {
+            "$lookup": {
+                "from": "employees",
+                "localField": "_id",
+                "foreignField": "emp_code",
+                "as": "emp",
+            }
+        },
+        {"$unwind": "$emp"},
+        {
+            "$project": {
+                "_id": 0,
+                "emp_code": "$_id",
+                "name": "$emp.name",
+                "department": "$emp.department",
+                "total_late_minutes": 1,
+                "late_count": 1,
+            }
+        },
+    ]
+
+    # Filter by department if requested before ranking
+    if department:
+        pipeline.append({"$match": {"department": department}})
+
+    # Competition ranking (1, 2, 2, 4) using $setWindowFields and $rank
+    pipeline.extend(
+        [
+            {
+                "$setWindowFields": {
+                    "sortBy": {"total_late_minutes": DESCENDING},
+                    "output": {
+                        "rank": {"$rank": {}},
+                    },
+                }
+            },
+            # Apply limit after ranking (rank <= limit) to include ties at cutoff
+            {
+                "$match": {
+                    "rank": {"$lte": limit},
+                }
+            },
+            # Sort output by total_late_minutes DESC, emp_code ASC
+            {
+                "$sort": {
+                    "total_late_minutes": DESCENDING,
+                    "emp_code": ASCENDING,
+                }
+            },
+        ]
+    )
+
+    items = list(database.attendance_logs.aggregate(pipeline))
+
+    return {
+        "month": month,
+        "items": items,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# End of Milestone 6 Implementation
+# --------------------------------------------------------------------------- #
+
 
