@@ -246,7 +246,49 @@ def get_attendance_date_from_punch_in(punch_in_utc: datetime, shift_start: str, 
     return punch_in_ist.date().isoformat()
 
 
+def compute_working_days(start_date_str: str, end_date_str: str) -> int:
+    """
+    R7 Rule:
+    Computes Monday-Friday working days between start_date and end_date (inclusive).
+    """
+    if start_date_str > end_date_str:
+        return 0
+    cur = date.fromisoformat(start_date_str)
+    end = date.fromisoformat(end_date_str)
+    count = 0
+    while cur <= end:
+        if cur.weekday() < 5:  # Mon-Fri
+            count += 1
+        cur += timedelta(days=1)
+    return count
+
+
+
+def bson_to_json_safe(val: Any) -> Any:
+    """
+    Recursively converts BSON-specific types (Timestamp, datetime, ObjectId, Decimal128, bytes)
+    into standard JSON-serializable primitives.
+    """
+    if isinstance(val, dict):
+        return {str(k): bson_to_json_safe(v) for k, v in val.items()}
+    elif isinstance(val, list):
+        return [bson_to_json_safe(v) for v in val]
+    elif isinstance(val, (bytes, bytearray)):
+        return val.hex()
+    elif isinstance(val, datetime):
+        return int(val.timestamp() * 1000)
+    elif hasattr(val, "as_datetime"):  # bson.timestamp.Timestamp
+        return {"time": val.time, "inc": val.inc}
+    elif hasattr(val, "to_decimal"):  # bson.decimal128.Decimal128
+        return float(val.to_decimal())
+    elif hasattr(val, "__str__") and type(val).__module__.startswith("bson"):
+        return str(val)
+    return val
+
+
+
 def serialize_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
+
     """
     Serializes MongoDB documents for HTTP response:
     - Strips MongoDB '_id' and prevents synthetic 'id'
@@ -980,68 +1022,10 @@ def employee_monthly(
         total_late_minutes = 0
         total_overtime_minutes = 0
 
-    # Calculate working_days via MongoDB date expression: Monday-Friday from max(month_start, joined_on) to month_end
+    # Calculate working_days: Monday-Friday from max(month_start, joined_on) to month_end (R7)
     effective_start = max(month_start_date, emp["joined_on"])
-    if effective_start > month_end_date:
-        working_days = 0
-    else:
-        working_days_pipeline = [
-            {
-                "$documents": [
-                    {
-                        "start": {"$dateFromString": {"dateString": effective_start, "format": "%Y-%m-%d"}},
-                        "end": {"$dateFromString": {"dateString": month_end_date, "format": "%Y-%m-%d"}},
-                    }
-                ]
-            },
-            {
-                "$project": {
-                    "days": {
-                        "$range": [
-                            0,
-                            {
-                                "$add": [
-                                    {
-                                        "$dateDiff": {
-                                            "startDate": "$start",
-                                            "endDate": "$end",
-                                            "unit": "day",
-                                        }
-                                    },
-                                    1,
-                                ]
-                            },
-                        ]
-                    },
-                    "start": 1,
-                }
-            },
-            {"$unwind": "$days"},
-            {
-                "$project": {
-                    "current_date": {
-                        "$dateAdd": {
-                            "startDate": "$start",
-                            "unit": "day",
-                            "amount": "$days",
-                        }
-                    }
-                }
-            },
-            {
-                "$match": {
-                    "$expr": {
-                        "$and": [
-                            {"$gt": [{"$dayOfWeek": "$current_date"}, 1]},
-                            {"$lt": [{"$dayOfWeek": "$current_date"}, 7]},
-                        ]
-                    }
-                }
-            },
-            {"$count": "working_days"},
-        ]
-        wd_result = list(database.attendance_logs.aggregate(working_days_pipeline))
-        working_days = wd_result[0]["working_days"] if wd_result else 0
+    working_days = compute_working_days(effective_start, month_end_date)
+
 
     # Calculate attendance_pct
     if working_days > 0:
@@ -1173,7 +1157,9 @@ def department_trend(
 
     pipeline = build_department_trend_pipeline(department, from_date, to_date)
 
-    rows = list(database.attendance_logs.aggregate(pipeline))
+    res = database.command({"aggregate": 1, "pipeline": pipeline, "cursor": {}})
+    rows = res["cursor"]["firstBatch"]
+
 
     # Apply R8 4-decimal half-up rounding to rates and 2-decimal rounding to counts
     formatted_items = []
@@ -1777,7 +1763,7 @@ def explain_endpoint(
         return {
             "endpoint": endpoint_name,
             "collection": "attendance_logs",
-            "explain": explain_result,
+            "explain": bson_to_json_safe(explain_result),
         }
 
     elif endpoint == ExplainEndpointEnum.employee_monthly:
@@ -1810,7 +1796,7 @@ def explain_endpoint(
         return {
             "endpoint": endpoint_name,
             "collection": "attendance_logs",
-            "explain": explain_result,
+            "explain": bson_to_json_safe(explain_result),
         }
 
     elif endpoint == ExplainEndpointEnum.department_summary:
@@ -1841,7 +1827,7 @@ def explain_endpoint(
         return {
             "endpoint": endpoint_name,
             "collection": "employees",
-            "explain": explain_result,
+            "explain": bson_to_json_safe(explain_result),
         }
 
     elif endpoint == ExplainEndpointEnum.late_leaderboard:
@@ -1873,7 +1859,7 @@ def explain_endpoint(
         return {
             "endpoint": endpoint_name,
             "collection": "attendance_logs",
-            "explain": explain_result,
+            "explain": bson_to_json_safe(explain_result),
         }
 
     elif endpoint == ExplainEndpointEnum.department_trend:
@@ -1899,20 +1885,21 @@ def explain_endpoint(
         try:
             explain_result = database.command(
                 "explain",
-                {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}},
+                {"aggregate": 1, "pipeline": pipeline, "cursor": {}},
                 verbosity="executionStats",
             )
         except PyMongoError:
             try:
-                explain_result = database.attendance_logs.aggregate(pipeline).explain()
+                explain_result = database.command({"aggregate": 1, "pipeline": pipeline, "cursor": {}, "explain": True})
             except PyMongoError as e:
                 explain_result = {"error": str(e), "verbosity": "executionStats"}
 
         return {
             "endpoint": endpoint_name,
             "collection": "attendance_logs",
-            "explain": explain_result,
+            "explain": bson_to_json_safe(explain_result),
         }
+
 
     else:
         raise HTTPException(status_code=422, detail="Unsupported explain endpoint")
