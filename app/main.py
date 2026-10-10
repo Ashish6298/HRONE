@@ -463,6 +463,26 @@ class Leaderboard(BaseModel):
     items: List[LeaderboardItem]
 
 
+class TrendItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    date: str
+    is_working_day: bool
+    headcount: int
+    present_count: float
+    late_count: int
+    attendance_rate: Optional[float] = None
+    moving_avg_7d: Optional[float] = None
+
+
+class Trend(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    department: str
+    items: List[TrendItem]
+
+
+
 
 
 # --------------------------------------------------------------------------- #
@@ -1397,7 +1417,277 @@ def late_leaderboard(
 
 
 # --------------------------------------------------------------------------- #
-# End of Milestone 6 Implementation
+# Milestone 7: Department Daily Trend & Window Calculation Endpoint
 # --------------------------------------------------------------------------- #
+@app.get(
+    "/analytics/departments/{department}/trend",
+    response_model=Trend,
+    tags=["analytics"],
+)
+def department_trend(
+    department: str = Path(...),
+    from_date: str = Query(..., alias="from", pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    to_date: str = Query(..., alias="to", pattern=r"^\d{4}-\d{2}-\d{2}$"),
+):
+    if from_date > to_date:
+        raise HTTPException(status_code=422, detail="'from' date must be <= 'to' date")
+
+    try:
+        d_from = date.fromisoformat(from_date)
+        d_to = date.fromisoformat(to_date)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid date format")
+
+    total_days = (d_to - d_from).days + 1
+    if total_days > 92:
+        raise HTTPException(status_code=422, detail="Date range cannot exceed 92 calendar days")
+
+    database = get_db()
+    # Check if department exists in employees collection (404 if unknown)
+    dept_exists = database.employees.find_one({"department": department})
+    if not dept_exists:
+        raise HTTPException(status_code=404, detail="Department not found")
+
+    # Generate daily calendar series and compute metrics inside MongoDB aggregation
+    pipeline = [
+        # 1. Generate one document per calendar day in [from_date, to_date]
+        {
+            "$documents": [
+                {
+                    "start": {"$dateFromString": {"dateString": from_date, "format": "%Y-%m-%d"}},
+                    "end": {"$dateFromString": {"dateString": to_date, "format": "%Y-%m-%d"}},
+                }
+            ]
+        },
+        {
+            "$project": {
+                "days": {
+                    "$range": [
+                        0,
+                        {
+                            "$add": [
+                                {
+                                    "$dateDiff": {
+                                        "startDate": "$start",
+                                        "endDate": "$end",
+                                        "unit": "day",
+                                    }
+                                },
+                                1,
+                            ]
+                        },
+                    ]
+                },
+                "start": 1,
+            }
+        },
+        {"$unwind": "$days"},
+        {
+            "$project": {
+                "date_obj": {
+                    "$dateAdd": {
+                        "startDate": "$start",
+                        "unit": "day",
+                        "amount": "$days",
+                    }
+                }
+            }
+        },
+        {
+            "$project": {
+                "date_obj": 1,
+                "date_str": {"$dateToString": {"date": "$date_obj", "format": "%Y-%m-%d"}},
+                "dayOfWeek": {"$dayOfWeek": "$date_obj"},
+            }
+        },
+        {
+            "$project": {
+                "date": "$date_str",
+                "date_obj": 1,
+                "is_working_day": {
+                    "$and": [
+                        {"$gt": ["$dayOfWeek", 1]},
+                        {"$lt": ["$dayOfWeek", 7]},
+                    ]
+                },
+            }
+        },
+        # 2. Join employees to compute day-specific headcount (joined_on <= date)
+        {
+            "$lookup": {
+                "from": "employees",
+                "let": {"current_day": "$date"},
+                "pipeline": [
+                    {
+                        "$match": {
+                            "$expr": {
+                                "$and": [
+                                    {"$eq": ["$department", department]},
+                                    {"$lte": ["$joined_on", "$$current_day"]},
+                                ]
+                            }
+                        }
+                    },
+                    {"$count": "count"},
+                ],
+                "as": "hc_info",
+            }
+        },
+        {
+            "$addFields": {
+                "headcount": {
+                    "$cond": [
+                        {"$gt": [{"$size": "$hc_info"}, 0]},
+                        {"$arrayElemAt": ["$hc_info.count", 0]},
+                        0,
+                    ]
+                }
+            }
+        },
+        # 3. Join department attendance_logs for that date
+        {
+            "$lookup": {
+                "from": "attendance_logs",
+                "let": {"current_day": "$date"},
+                "pipeline": [
+                    {
+                        "$match": {
+                            "$expr": {
+                                "$eq": ["$date", "$$current_day"],
+                            }
+                        }
+                    },
+                    # Join employee to verify department
+                    {
+                        "$lookup": {
+                            "from": "employees",
+                            "localField": "emp_code",
+                            "foreignField": "emp_code",
+                            "as": "emp",
+                        }
+                    },
+                    {"$unwind": "$emp"},
+                    {
+                        "$match": {
+                            "emp.department": department,
+                        }
+                    },
+                    {
+                        "$project": {
+                            "present_val": {
+                                "$cond": [
+                                    {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                    {"$cond": [{"$eq": ["$half_day", True]}, 0.5, 1.0]},
+                                    0.0,
+                                ]
+                            },
+                            "is_late": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]},
+                        }
+                    },
+                    {
+                        "$group": {
+                            "_id": None,
+                            "present_count": {"$sum": "$present_val"},
+                            "late_count": {"$sum": "$is_late"},
+                        }
+                    },
+                ],
+                "as": "log_metrics",
+            }
+        },
+        {
+            "$addFields": {
+                "present_count": {
+                    "$cond": [
+                        {"$gt": [{"$size": "$log_metrics"}, 0]},
+                        {"$arrayElemAt": ["$log_metrics.present_count", 0]},
+                        0.0,
+                    ]
+                },
+                "late_count": {
+                    "$cond": [
+                        {"$gt": [{"$size": "$log_metrics"}, 0]},
+                        {"$arrayElemAt": ["$log_metrics.late_count", 0]},
+                        0,
+                    ]
+                },
+            }
+        },
+        # 4. Compute attendance_rate: only on working days with headcount > 0; otherwise null
+        {
+            "$addFields": {
+                "attendance_rate": {
+                    "$cond": [
+                        {
+                            "$and": [
+                                "$is_working_day",
+                                {"$gt": ["$headcount", 0]},
+                            ]
+                        },
+                        {"$divide": ["$present_count", "$headcount"]},
+                        None,
+                    ]
+                }
+            }
+        },
+        {"$sort": {"date": ASCENDING}},
+        # 5. Compute 7-day moving average of non-null attendance_rate using $setWindowFields
+        {
+            "$setWindowFields": {
+                "sortBy": {"date": ASCENDING},
+                "output": {
+                    "moving_avg_7d": {
+                        "$avg": "$attendance_rate",
+                        "window": {
+                            "documents": [-6, "current"],
+                        },
+                    }
+                },
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "date": 1,
+                "is_working_day": 1,
+                "headcount": 1,
+                "present_count": 1,
+                "late_count": 1,
+                "attendance_rate": 1,
+                "moving_avg_7d": 1,
+            }
+        },
+        {"$sort": {"date": ASCENDING}},
+    ]
+
+    rows = list(database.attendance_logs.aggregate(pipeline))
+
+    # Apply R8 4-decimal half-up rounding to rates and 2-decimal rounding to counts
+    formatted_items = []
+    for r in rows:
+        att_rate = r.get("attendance_rate")
+        m_avg = r.get("moving_avg_7d")
+        formatted_items.append(
+            {
+                "date": r["date"],
+                "is_working_day": r["is_working_day"],
+                "headcount": r["headcount"],
+                "present_count": round_half_up(r["present_count"], 2),
+                "late_count": r["late_count"],
+                "attendance_rate": round_half_up(att_rate, 4) if att_rate is not None else None,
+                "moving_avg_7d": round_half_up(m_avg, 4) if m_avg is not None else None,
+            }
+        )
+
+    return {
+        "department": department,
+        "items": formatted_items,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# End of Milestone 7 Implementation
+# --------------------------------------------------------------------------- #
+
 
 

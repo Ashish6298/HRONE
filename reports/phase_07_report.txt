@@ -1,0 +1,38 @@
+======================================================================
+PHASE REPORT: MILESTONE 7 (Phase 7.1)
+EMPLOYEE ATTENDANCE & ANALYTICS API
+======================================================================
+
+Date: 2026-10-10
+Environment: Windows, Python 3.11.4, FastAPI, PyMongo, Pydantic, PyTest
+Branch: ashish
+
+----------------------------------------------------------------------
+1. PHASE 7.1 — DEPARTMENT DAILY TREND AGGREGATION & MOVING AVERAGE
+----------------------------------------------------------------------
+- Implemented `GET /analytics/departments/{department}/trend` backed by a MongoDB aggregation pipeline.
+- Enforced validation rules:
+  * 404 for unknown department.
+  * 422 for `from > to` or date range exceeding 92 calendar days.
+- **Aggregation Pipeline Features (Zero Python Loops)**:
+  * **Gap-Filling & Date Generation**: Uses MongoDB `$documents`, `$dateDiff`, `$range`, and `$dateAdd` to generate exactly one document per calendar day in `[from, to]`, including weekends and zero-log days.
+  * **Day-Specific Headcount**: Dynamically looks up department employees with `joined_on <= date` for each day (R9).
+  * **Daily Presence & Late Counts**: Looks up department attendance records for the date to compute `present_count` (`half_day` = 0.5) and `late_count`.
+  * **Attendance Rate**: `present_count / headcount` on working days with `headcount > 0` (0.0 on zero-log working days with headcount > 0; `null` on weekends or when `headcount == 0`).
+  * **7-Day Moving Average**: Computed directly in MongoDB using `$setWindowFields` over `window: {documents: [-6, "current"]}` sorted by `date ASC`. Excludes `null` attendance rates from moving average calculation, naturally handling the shorter window for initial days inside the requested date range.
+  * Applied R8 4-decimal half-up rounding for rates and 2-decimal rounding for counts.
+
+----------------------------------------------------------------------
+2. AUTOMATED TEST RESULTS
+----------------------------------------------------------------------
+- Executed full test suite across Milestones 1 through 7:
+  * Total tests run: 30
+  * Passed: 30
+  * Failed: 0
+  * Status: 100% PASS
+
+----------------------------------------------------------------------
+3. READINESS FOR NEXT PHASE
+----------------------------------------------------------------------
+Status: READY FOR MILESTONE 8 (Explain Endpoint and Performance Proof).
+All analytics endpoints (employee monthly, department summary, late leaderboard, department trend) are implemented and verified.

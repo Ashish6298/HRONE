@@ -21,8 +21,8 @@ def test_starter_routes_present():
 
 def test_missing_endpoints_in_starter():
     routes = {route.path for route in app.routes}
-    assert "/analytics/departments/{department}/trend" not in routes
     assert "/admin/explain/{endpoint}" not in routes
+
 
 
 
