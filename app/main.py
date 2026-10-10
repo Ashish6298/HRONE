@@ -52,10 +52,12 @@ db: Optional[Database] = None
 def get_mongo_client() -> MongoClient:
     global mongo_client
     if mongo_client is None:
+        load_dotenv(override=True)
+        uri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
         mongo_client = MongoClient(
-            MONGO_URI,
-            serverSelectionTimeoutMS=2000,
-            connectTimeoutMS=2000,
+            uri,
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=5000,
             tz_aware=True,
         )
     return mongo_client
@@ -65,7 +67,9 @@ def get_db() -> Database:
     global db
     if db is None:
         client = get_mongo_client()
-        db = client[MONGO_DB]
+        load_dotenv(override=True)
+        db_name = os.getenv("MONGO_DB", "attendance_db")
+        db = client[db_name]
     return db
 
 
