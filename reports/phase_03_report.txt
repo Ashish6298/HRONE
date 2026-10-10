@@ -1,0 +1,52 @@
+======================================================================
+PHASE REPORT: MILESTONE 3 (Phases 3.1, 3.2, 3.3, 3.4)
+EMPLOYEE ATTENDANCE & ANALYTICS API
+======================================================================
+
+Date: 2026-10-10
+Environment: Windows, Python 3.11.4, FastAPI, PyMongo, Pydantic, PyTest
+Branch: ashish
+
+----------------------------------------------------------------------
+1. PHASE 3.1 — EMPLOYEE CREATION REPAIR
+----------------------------------------------------------------------
+- Added strict Pydantic EmployeeCreate validation with regex patterns for `emp_code` (^EMP\d{4,6}$), email format, department length, and shift times validation (`shift_start != shift_end`).
+- Mapped database `DuplicateKeyError` to HTTP 409 Conflict, ensuring concurrency guarantees.
+- Stored `created_at` as UTC datetime truncated to seconds.
+- Serialized response to return integer epoch milliseconds without exposing MongoDB `_id` or synthetic `id`.
+
+----------------------------------------------------------------------
+2. PHASE 3.2 — EMPLOYEE LISTING & PAGINATION REPAIR
+----------------------------------------------------------------------
+- Fixed the skip calculation bug: replaced `skip = page * page_size` with `skip = (page - 1) * page_size` so page 1 correctly returns the first batch of employees.
+- Fixed total count to use the active query filter dictionary `q` so department-filtered counts reflect the filtered subset rather than the entire collection.
+- Enforced ascending sort by `emp_code` and MongoDB-side pagination (`skip`/`limit`).
+
+----------------------------------------------------------------------
+3. PHASE 3.3 — ATTENDANCE LISTING REPAIR
+----------------------------------------------------------------------
+- Implemented query filtering for `emp_code`, `status`, `date_from`, and `date_to`.
+- Added validation raising HTTP 422 if `date_from > date_to`.
+- Replaced in-memory loading and sorting with MongoDB query cursor sorting (`[("date", -1), ("emp_code", 1)]`) and pagination, ensuring memory efficiency over 100k+ records.
+- Sanitized output using `serialize_doc()` removing `_id` and synthetic `id`.
+
+----------------------------------------------------------------------
+4. PHASE 3.4 — DEFECT AUDIT & REVIEW.MD UPDATE
+----------------------------------------------------------------------
+- Documented all 13 discovered and repaired defects in `REVIEW.md` with location, problem, detection symptom/test, and exact fix applied.
+- Documented verified sound design choices (data model consistency and stateless REST API).
+
+----------------------------------------------------------------------
+5. AUTOMATED TEST RESULTS
+----------------------------------------------------------------------
+- Executed full test suite across Milestones 1, 2, and 3:
+  * Total tests run: 17
+  * Passed: 17
+  * Failed: 0
+  * Status: 100% PASS
+
+----------------------------------------------------------------------
+6. READINESS FOR NEXT PHASE
+----------------------------------------------------------------------
+Status: READY FOR MILESTONE 4 (Time Engine and Attendance Lifecycle).
+All starter CRUD endpoints, query pagination, R2/R3/R4 time engine boundaries, and documentation in REVIEW.md are verified.
