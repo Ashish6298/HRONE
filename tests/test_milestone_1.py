@@ -19,9 +19,13 @@ def test_starter_routes_present():
     assert "/attendance/{emp_code}/{date}" in routes
 
 
-def test_missing_endpoints_in_starter():
+def test_all_milestone_routes_present():
     routes = {route.path for route in app.routes}
-    assert "/admin/explain/{endpoint}" not in routes
+    assert "/admin/explain/{endpoint}" in routes
+    assert "/analytics/employees/{emp_code}/monthly" in routes
+    assert "/analytics/departments/summary" in routes
+    assert "/analytics/leaderboard/late" in routes
+    assert "/analytics/departments/{department}/trend" in routes
 
 
 
