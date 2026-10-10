@@ -35,7 +35,9 @@ jobs:
 
       - name: Run Test Suite
         env:
+          PYTHONPATH: .
           MONGO_URI: mongodb://localhost:27017
           MONGO_DB: test_attendance_db
         run: |
-          pytest -v
+          python -m pytest -v
+
