@@ -1,0 +1,41 @@
+name: Tests and Quality Checks
+
+on:
+  push:
+    branches: [ main, master, ashish ]
+  pull_request:
+    branches: [ main, master, ashish ]
+
+jobs:
+  test:
+    name: Run Automated Tests & Verifications
+    runs-on: ubuntu-latest
+
+    services:
+      mongodb:
+        image: mongo:7.0
+        ports:
+          - 27017:27017
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Runtime & Test Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio httpx
+
+      - name: Run Test Suite
+        env:
+          MONGO_URI: mongodb://localhost:27017
+          MONGO_DB: test_attendance_db
+        run: |
+          pytest -v
