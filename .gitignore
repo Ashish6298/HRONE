@@ -64,3 +64,10 @@ Thumbs.db
 *.db
 local_data/
 dump/
+
+# Internal Candidate Kit & Temporary Files
+phase.txt
+reports/
+sample_seed.py
+PROBLEM_STATEMENT.docx
+
