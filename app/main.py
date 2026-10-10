@@ -411,6 +411,21 @@ class RegularizeRequest(BaseModel):
         return v
 
 
+class EmployeeMonthly(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    emp_code: str
+    month: str
+    working_days: int
+    present_days: float
+    leave_days: int
+    late_count: int
+    total_late_minutes: int
+    total_overtime_minutes: int
+    attendance_pct: Optional[float] = None
+
+
+
 # --------------------------------------------------------------------------- #
 # Shift & Attendance Time Engine Helpers (R1-R5)
 # --------------------------------------------------------------------------- #
@@ -844,5 +859,193 @@ def list_attendance(
 
 
 # --------------------------------------------------------------------------- #
-# End of Milestone 4 Implementation
+# Milestone 5: Employee Monthly Analytics Endpoint
 # --------------------------------------------------------------------------- #
+@app.get(
+    "/analytics/employees/{emp_code}/monthly",
+    response_model=EmployeeMonthly,
+    tags=["analytics"],
+)
+def employee_monthly(
+    emp_code: str = Path(...),
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+):
+    database = get_db()
+    emp = database.employees.find_one({"emp_code": emp_code})
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    year, m = map(int, month.split("-"))
+    month_start_date = f"{year:04d}-{m:02d}-01"
+    if m == 12:
+        next_month_start_date = f"{year+1:04d}-01-01"
+        month_end_date = f"{year:04d}-12-31"
+    else:
+        next_month_start_date = f"{year:04d}-{m+1:02d}-01"
+        # Find last day of month
+        last_day = (date(year, m + 1, 1) - timedelta(days=1)).day
+        month_end_date = f"{year:04d}-{m:02d}-{last_day:02d}"
+
+    # Pipeline to compute employee monthly attendance metrics directly in MongoDB
+    pipeline = [
+        # Match records for this employee within the requested calendar month
+        {
+            "$match": {
+                "emp_code": emp_code,
+                "date": {"$gte": month_start_date, "$lte": month_end_date},
+            }
+        },
+        # Add computed fields for day of week and presence contributions
+        {
+            "$addFields": {
+                "date_obj": {"$dateFromString": {"dateString": "$date", "format": "%Y-%m-%d"}},
+            }
+        },
+        {
+            "$addFields": {
+                "dayOfWeek": {"$dayOfWeek": "$date_obj"},  # 1 (Sun) to 7 (Sat)
+                "is_weekday": {
+                    "$and": [
+                        {"$gt": [{"$dayOfWeek": "$date_obj"}, 1]},
+                        {"$lt": [{"$dayOfWeek": "$date_obj"}, 7]},
+                    ]
+                },
+            }
+        },
+        {
+            "$addFields": {
+                "present_contribution": {
+                    "$cond": [
+                        {
+                            "$and": [
+                                "$is_weekday",
+                                {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                            ]
+                        },
+                        {"$cond": [{"$eq": ["$half_day", True]}, 0.5, 1.0]},
+                        0.0,
+                    ]
+                },
+                "is_leave": {
+                    "$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0],
+                },
+                "is_late": {
+                    "$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0],
+                },
+            }
+        },
+        {
+            "$group": {
+                "_id": None,
+                "present_days": {"$sum": "$present_contribution"},
+                "leave_days": {"$sum": "$is_leave"},
+                "late_count": {"$sum": "$is_late"},
+                "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+                "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+            }
+        },
+    ]
+
+    agg_result = list(database.attendance_logs.aggregate(pipeline))
+
+    if agg_result:
+        metrics = agg_result[0]
+        present_days = float(metrics.get("present_days", 0.0))
+        leave_days = int(metrics.get("leave_days", 0))
+        late_count = int(metrics.get("late_count", 0))
+        total_late_minutes = int(metrics.get("total_late_minutes", 0))
+        total_overtime_minutes = int(metrics.get("total_overtime_minutes", 0))
+    else:
+        present_days = 0.0
+        leave_days = 0
+        late_count = 0
+        total_late_minutes = 0
+        total_overtime_minutes = 0
+
+    # Calculate working_days via MongoDB date expression: Monday-Friday from max(month_start, joined_on) to month_end
+    effective_start = max(month_start_date, emp["joined_on"])
+    if effective_start > month_end_date:
+        working_days = 0
+    else:
+        working_days_pipeline = [
+            {
+                "$documents": [
+                    {
+                        "start": {"$dateFromString": {"dateString": effective_start, "format": "%Y-%m-%d"}},
+                        "end": {"$dateFromString": {"dateString": month_end_date, "format": "%Y-%m-%d"}},
+                    }
+                ]
+            },
+            {
+                "$project": {
+                    "days": {
+                        "$range": [
+                            0,
+                            {
+                                "$add": [
+                                    {
+                                        "$dateDiff": {
+                                            "startDate": "$start",
+                                            "endDate": "$end",
+                                            "unit": "day",
+                                        }
+                                    },
+                                    1,
+                                ]
+                            },
+                        ]
+                    },
+                    "start": 1,
+                }
+            },
+            {"$unwind": "$days"},
+            {
+                "$project": {
+                    "current_date": {
+                        "$dateAdd": {
+                            "startDate": "$start",
+                            "unit": "day",
+                            "amount": "$days",
+                        }
+                    }
+                }
+            },
+            {
+                "$match": {
+                    "$expr": {
+                        "$and": [
+                            {"$gt": [{"$dayOfWeek": "$current_date"}, 1]},
+                            {"$lt": [{"$dayOfWeek": "$current_date"}, 7]},
+                        ]
+                    }
+                }
+            },
+            {"$count": "working_days"},
+        ]
+        wd_result = list(database.attendance_logs.aggregate(working_days_pipeline))
+        working_days = wd_result[0]["working_days"] if wd_result else 0
+
+    # Calculate attendance_pct
+    if working_days > 0:
+        raw_pct = (present_days / working_days) * 100.0
+        attendance_pct = round_half_up(raw_pct, 2)
+    else:
+        attendance_pct = None
+
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": round_half_up(present_days, 2),
+        "leave_days": leave_days,
+        "late_count": late_count,
+        "total_late_minutes": total_late_minutes,
+        "total_overtime_minutes": total_overtime_minutes,
+        "attendance_pct": attendance_pct,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# End of Milestone 5 Implementation
+# --------------------------------------------------------------------------- #
+
